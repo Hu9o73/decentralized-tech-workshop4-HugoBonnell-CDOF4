@@ -1,35 +1,38 @@
 import bodyParser from "body-parser";
 import express from "express";
-import { BASE_USER_PORT, BASE_ONION_ROUTER_PORT } from "../config";
-import { rsaEncrypt } from "../crypto";
-import { GetNodeRegistryBody } from "../registry/registry";
-import { REGISTRY_PORT } from "../config";
+import axios from "axios";
+import { BASE_USER_PORT, REGISTRY_PORT, BASE_ONION_ROUTER_PORT } from "../config";
+import { rsaEncrypt, symEncrypt, createRandomSymmetricKey, exportSymKey } from "../crypto";
 
 export type SendMessageBody = {
   message: string;
   destinationUserId: number;
 };
 
+type Node = {
+  nodeId: number;
+  pubKey: string;
+};
+
+let lastSentMessage: string | null = null;
+let lastReceivedMessage: string | null = null;
+
 export async function user(userId: number) {
   const _user = express();
   _user.use(express.json());
   _user.use(bodyParser.json());
 
-  // State management
-  let lastReceivedMessage: string | null = null;
-  let lastSentMessage: string | null = null;
-
-  // Basic status route
+  // Status route
   _user.get("/status", (req, res) => {
     res.send("live");
   });
 
-  // Route to get the last received message
+  // Route to get last received message
   _user.get("/getLastReceivedMessage", (req, res) => {
     res.json({ result: lastReceivedMessage });
   });
 
-  // Route to get the last sent message
+  // Route to get last sent message
   _user.get("/getLastSentMessage", (req, res) => {
     res.json({ result: lastSentMessage });
   });
@@ -38,76 +41,86 @@ export async function user(userId: number) {
   _user.post("/message", (req, res) => {
     const { message } = req.body;
     lastReceivedMessage = message;
-    res.send("success"); // Changed to match expected response
+    console.log(`User ${userId} received message: ${message}`);
+    res.send("success");
   });
 
-  // Route to send messages (to be implemented)
+  // Route to send messages
   _user.post("/sendMessage", async (req, res) => {
-    const { message, destinationUserId } = req.body as SendMessageBody;
-    lastSentMessage = message;
-    // Implementation for sending messages through the onion network will be added here
-    res.json({ status: "Message sent successfully" });
-  });
-
-  // Add this route to return the last circuit
-  _user.get("/getLastCircuit", (req, res) => {
-    res.json({ result: lastCircuit });
-  });
-
-  // Add a variable to store the last circuit
-  let lastCircuit: number[] = [];
-
-  // Route to send message
-  _user.post("/sendMessage", async (req, res) => {
-    const { message, destinationUserId } = req.body as SendMessageBody;
-    lastSentMessage = message;
-
-    // Generate a random circuit with 3 unique nodes
-    lastCircuit = [];
-    while (lastCircuit.length < 3) {
-      const randomNode = Math.floor(Math.random() * 10);
-      if (!lastCircuit.includes(randomNode)) {
-        lastCircuit.push(randomNode);
+    try {
+      const { message, destinationUserId } = req.body as SendMessageBody;
+      lastSentMessage = message;
+      
+      // 1. Fetch the registry of onion routers
+      const registryResponse = await axios.get(`http://localhost:${REGISTRY_PORT}/registry`);
+      const nodes: Node[] = registryResponse.data.nodes;
+      
+      if (nodes.length < 3) {
+        throw new Error("Not enough onion routers available (minimum 3 required)");
       }
-    }
-
-    console.log(`User ${userId} generated circuit:`, lastCircuit);
-
-    // Retrieve public keys from the registry
-    const nodes = await fetch(`http://localhost:${REGISTRY_PORT}/getNodeRegistry`)
-      .then((res) => res.json() as Promise<GetNodeRegistryBody>)
-      .then((json) => json.nodes);
-
-    let encryptedMessage = message;
-    for (let i = 0; i < lastCircuit.length; i++) {
-      const nodePort = BASE_ONION_ROUTER_PORT + lastCircuit[i];
-      const nextDestination = i < lastCircuit.length - 1 ? BASE_ONION_ROUTER_PORT + lastCircuit[i + 1] : BASE_USER_PORT + destinationUserId;
-
-      // Find the public key for the current node in the circuit
-      const node = nodes.find((n) => n.nodeId === lastCircuit[i]);
-      if (!node) {
-        console.error(`User ${userId}: Node ${lastCircuit[i]} not found in registry`);
-        return res.status(500).send("Node not found in registry");
+      
+      // 2. Select 3 random routers for the circuit
+      const selectedNodes = selectRandomNodes(nodes, 3);
+      const circuit = selectedNodes.map(node => node.nodeId);
+      
+      // 3. Create a symmetric key for the message
+      const symmetricKey = await createRandomSymmetricKey();
+      const exportedSymKey = await exportSymKey(symmetricKey);
+      
+      // 4. Encrypt the actual message with the symmetric key
+      const encryptedMessage = await symEncrypt(symmetricKey, message);
+      
+      // 5. Create the onion-layered data
+      const finalDestination = {
+        type: "final",
+        userId: destinationUserId,
+        data: encryptedMessage
+      };
+      
+      // Build the onion from inside out
+      let currentPayload = JSON.stringify(finalDestination);
+      
+      // Reverse the array to encrypt from last node to first node
+      for (let i = selectedNodes.length - 1; i >= 0; i--) {
+        const node = selectedNodes[i];
+        
+        // If this is the last router, include the symmetric key
+        const nextHop = i === 0 ? 
+          { 
+            type: "relay",
+            symKey: exportedSymKey,
+            data: currentPayload
+          } : 
+          {
+            type: "relay",
+            nextNodeId: selectedNodes[i - 1].nodeId,
+            data: currentPayload
+          };
+        
+        // Encrypt this layer with the router's public key
+        currentPayload = await rsaEncrypt(
+          JSON.stringify(nextHop),
+          node.pubKey
+        );
       }
-
-      // Encrypt the message with the node's public key
-      encryptedMessage = await rsaEncrypt(encryptedMessage, node.pubKey);
-      console.log(`User ${userId} encrypted message for node ${lastCircuit[i]}:`, encryptedMessage);
-
-      // Forward the message to the next destination
-      await fetch(`http://localhost:${nodePort}/forwardMessage`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ encryptedMessage, nextDestination }),
+      
+      // 6. Send the onion to the first node
+      const firstNode = selectedNodes[selectedNodes.length - 1];
+      await axios.post(
+        `http://localhost:${BASE_ONION_ROUTER_PORT + firstNode.nodeId}/message`,
+        { data: currentPayload }
+      );
+      
+      res.json({ 
+        status: "Message sent successfully",
+        circuit
       });
-
-      console.log(`User ${userId} forwarded message to node ${lastCircuit[i]}`);
+    } catch (error) {
+      console.error("Failed to send message:", error);
+      res.status(500).json({ 
+        status: "Error sending message", 
+      });
     }
-
-    res.json({ status: "Message sent successfully" });
-    return;
   });
 
   const server = _user.listen(BASE_USER_PORT + userId, () => {
@@ -117,4 +130,10 @@ export async function user(userId: number) {
   });
 
   return server;
+}
+
+// Helper function to select random nodes
+function selectRandomNodes(nodes: Node[], count: number): Node[] {
+  const shuffled = [...nodes].sort(() => 0.5 - Math.random());
+  return shuffled.slice(0, count);
 }
