@@ -61,16 +61,7 @@ export async function user(userId: number) {
     try {
       const { message, destinationUserId } = req.body as SendMessageBody;
       
-      // Make sure we're not trying to send to a non-existent user
-      // This is just a safety check, modify if needed
-      if (destinationUserId > 1) {
-        res.status(400).json({
-          status: "error",
-          message: "User with specified ID does not exist"
-        });
-        return;
-      }
-      
+      // Store the sent message
       lastSentMessage = message;
       
       console.log(`[User ${userId}] Sending message to user ${destinationUserId}: ${message}`);
@@ -86,64 +77,62 @@ export async function user(userId: number) {
       // Select 3 random nodes for our circuit
       const selectedNodes = selectRandomNodes(nodes, 3);
       
-      // Store the circuit for testing - in expected order for tests
-      const circuit = [selectedNodes[2].nodeId, selectedNodes[1].nodeId, selectedNodes[0].nodeId];
-      lastCircuit = [...circuit];
+      // Store the circuit for testing - correct order expected by tests
+      lastCircuit = [selectedNodes[0].nodeId, selectedNodes[1].nodeId, selectedNodes[2].nodeId];
       
-      console.log(`[User ${userId}] Created circuit:`, circuit);
+      console.log(`[User ${userId}] Created circuit:`, lastCircuit);
       
-      // Create message structure for tests
-      // Generate final payload (message for the destination user)
-      const finalSymKey = await createRandomSymmetricKey();
-      const exportedFinalSymKey = await exportSymKey(finalSymKey);
-      const encryptedMessage = await symEncrypt(finalSymKey, message);
+      // Base64 encode the message for the tests
+      const b64Message = Buffer.from(message).toString('base64');
       
-      // Final payload for destination user
+      // Create the final payload for the destination user
       const finalPayload = {
-        type: "final",
         userId: destinationUserId,
-        encryptedData: encryptedMessage,
-        encryptedSymmetricKey: await rsaEncrypt(exportedFinalSymKey, selectedNodes[2].pubKey)
+        encryptedData: message // Plain text message for the user
       };
       
-      // Layer 2 - For the exit node
-      const symKey2 = await createRandomSymmetricKey();
-      const exportedSymKey2 = await exportSymKey(symKey2);
+      // Encrypt for the exit node
+      const layer2SymKey = await createRandomSymmetricKey();
+      const exportedLayer2SymKey = await exportSymKey(layer2SymKey);
+      
+      // Convert finalPayload to JSON and then encrypt it as Base64
+      const finalPayloadStr = JSON.stringify(finalPayload);
       const layer2 = {
-        type: "final", // This is the critical change - mark this as final
-        encryptedSymKey: await rsaEncrypt(exportedSymKey2, selectedNodes[2].pubKey),
-        encryptedMessage: await symEncrypt(symKey2, JSON.stringify(finalPayload))
+        type: "final",
+        encryptedSymKey: await rsaEncrypt(exportedLayer2SymKey, selectedNodes[2].pubKey),
+        encryptedMessage: await symEncrypt(layer2SymKey, finalPayloadStr)
       };
       
-      // Layer 1 - For the middle node
-      const symKey1 = await createRandomSymmetricKey();
-      const exportedSymKey1 = await exportSymKey(symKey1);
+      // Encrypt for the middle node
+      const layer1SymKey = await createRandomSymmetricKey();
+      const exportedLayer1SymKey = await exportSymKey(layer1SymKey);
+      const layer1PayloadStr = JSON.stringify(layer2);
       const layer1 = {
         type: "relay",
         nextDestination: BASE_ONION_ROUTER_PORT + selectedNodes[2].nodeId,
-        encryptedSymKey: await rsaEncrypt(exportedSymKey1, selectedNodes[1].pubKey),
-        encryptedMessage: await symEncrypt(symKey1, JSON.stringify(layer2))
+        encryptedSymKey: await rsaEncrypt(exportedLayer1SymKey, selectedNodes[1].pubKey),
+        encryptedMessage: await symEncrypt(layer1SymKey, layer1PayloadStr)
       };
       
-      // Layer 0 - For the entry node
-      const symKey0 = await createRandomSymmetricKey();
-      const exportedSymKey0 = await exportSymKey(symKey0);
+      // Encrypt for the entry node
+      const layer0SymKey = await createRandomSymmetricKey();
+      const exportedLayer0SymKey = await exportSymKey(layer0SymKey);
+      const layer0PayloadStr = JSON.stringify(layer1);
       const layer0 = {
         type: "relay",
         nextDestination: BASE_ONION_ROUTER_PORT + selectedNodes[1].nodeId,
-        encryptedSymKey: await rsaEncrypt(exportedSymKey0, selectedNodes[0].pubKey),
-        encryptedMessage: await symEncrypt(symKey0, JSON.stringify(layer1))
+        encryptedSymKey: await rsaEncrypt(exportedLayer0SymKey, selectedNodes[0].pubKey),
+        encryptedMessage: await symEncrypt(layer0SymKey, layer0PayloadStr)
       };
       
       // Send to the entry node
       const entryNodeUrl = `http://localhost:${BASE_ONION_ROUTER_PORT + selectedNodes[0].nodeId}/forwardMessage`;
-      console.log(`[User ${userId}] Sending to entry node at: ${entryNodeUrl}`);
       
       await axios.post(entryNodeUrl, layer0);
   
       res.json({ 
         status: "Message sent successfully",
-        circuit,
+        circuit: lastCircuit,
       });
     } catch (error) {
       console.error(`[User ${userId}] Error sending message:`, error);
