@@ -101,8 +101,9 @@ export async function rsaEncrypt(
   const publicKey = await importPubKey(strPublicKey);
   
   // Check the length of the data being passed to RSA encryption
+  console.log(`[SUBDEBUG] b64Data:`, b64Data)
   const data = base64ToArrayBuffer(b64Data);
-  console.log(data)
+  console.log(`[SUBDEBUG] data:`, data)
   if (data.byteLength > 245) {
     console.error("Data is too large for RSA encryption");
     throw new Error("Data is too large for RSA encryption");
@@ -121,14 +122,25 @@ export async function rsaDecrypt(
   data: string,
   privateKey: webcrypto.CryptoKey
 ): Promise<string> {
-  const encryptedData = base64ToArrayBuffer(data);
-  const decrypted = await webcrypto.subtle.decrypt(
-    { name: "RSA-OAEP" },
-    privateKey,
-    encryptedData
-  );
-  return arrayBufferToBase64(decrypted);
+  if (!data) {
+    throw new Error("[ERROR] RSA decryption data is missing or malformed");
+  }
+
+  try {
+    const encryptedData = base64ToArrayBuffer(data);
+    const decrypted = await webcrypto.subtle.decrypt(
+      { name: "RSA-OAEP" },
+      privateKey,
+      encryptedData
+    );
+    return arrayBufferToBase64(decrypted);
+  } catch (error) {
+    console.error("[ERROR] Failed to decrypt data:", error);
+    throw error;
+  }
 }
+
+
 
 // ######################
 // ### Symmetric keys ###

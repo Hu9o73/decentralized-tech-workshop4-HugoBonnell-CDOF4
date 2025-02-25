@@ -79,6 +79,11 @@ export async function simpleOnionRouter(nodeId: number) {
   // Route to handle message forwarding
   onionRouter.post("/forwardMessage", async (req, res) => {
     const { encryptedMessage, nextDestination } = req.body;
+    console.log("[DEBUG] Received message in forwardMessage:", req.body);
+    if (!encryptedMessage) {
+      console.error("[ERROR] Encrypted message is missing!");
+      return res.status(400).json({ status: "Error: Encrypted message is missing!" });
+    }
     lastReceivedEncryptedMessage = encryptedMessage;
     lastMessageDestination = nextDestination;
   
@@ -105,6 +110,7 @@ export async function simpleOnionRouter(nodeId: number) {
       console.error(`Node ${nodeId}: Private key is not available`);
       res.status(500).send("Private key is not available");
     }
+    return;
   });
 
   const server = onionRouter.listen(BASE_ONION_ROUTER_PORT + nodeId, () => {
