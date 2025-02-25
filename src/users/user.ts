@@ -80,33 +80,32 @@ export async function user(userId: number) {
   
       // Generate AES key for symmetric encryption
       const symmetricKey = await createRandomSymmetricKey();
-      console.log(`[DEBUG] symmetricKey :`, symmetricKey);
       const exportedSymKey = await exportSymKey(symmetricKey);
-      console.log(`[DEBUG] exportedSymKey :`, symmetricKey);
-
+  
       // Encrypt the message with the AES symmetric key
       console.log(`[DEBUG] message :`, message);
       const encryptedMessage = await symEncrypt(symmetricKey, message);
       console.log(`[DEBUG] encryptedMessage :`, encryptedMessage);
-
-      // Encrypt the AES key with the RSA public key of the final node (for example, using the last node)
-      const finalNode = selectedNodes[selectedNodes.length - 1];
-      console.log(exportedSymKey)
+  
+      // Encrypt the AES key with the RSA public key of the final node
+      const finalNode = selectedNodes[0]; // FIXED: Use the first node in the array as the final node
+      console.log(exportedSymKey);
       const encryptedSymmetricKey = await rsaEncrypt(exportedSymKey, finalNode.pubKey);
       console.log(`[DEBUG] encryptedSymKey :`, encryptedSymmetricKey);
   
-      // Construct the payload to send to the first node in the circuit
+      // Construct the payload for the final destination
       const finalDestination = {
         type: "final",
         userId: destinationUserId,
         encryptedData: encryptedMessage,
-        encryptedSymmetricKey: encryptedSymmetricKey,  // Encrypted AES key
+        encryptedSymmetricKey: encryptedSymmetricKey,
       };
   
       let currentPayload = JSON.stringify(finalDestination);
   
-      // Relay the message through the circuit
-      for (let i = selectedNodes.length - 1; i >= 0; i--) {
+      // Build the onion in the correct order: from the innermost (final destination) to the outermost layer
+      // FIXED: Loop from 0 to length-1 instead of length-1 to 0
+      for (let i = 0; i < selectedNodes.length; i++) {
         const node = selectedNodes[i];
     
         // Generate AES key for this hop
@@ -121,17 +120,19 @@ export async function user(userId: number) {
     
         // New payload for this hop
         currentPayload = JSON.stringify({
-            type: "relay",
-            nextDestination: i > 0 ? selectedNodes[i - 1].nodeId : undefined,
-            encryptedSymKey: encryptedRelaySymKey,
-            encryptedMessage: encryptedData,
+          type: "relay",
+          // FIXED: Calculate the next destination correctly
+          nextDestination: i < selectedNodes.length - 1 ? selectedNodes[i + 1].nodeId : undefined,
+          encryptedSymKey: encryptedRelaySymKey,
+          encryptedMessage: encryptedData,
         });
-    }
+      }
   
       // Send the wrapped message to the first node in the circuit
-      const firstNode = selectedNodes[selectedNodes.length - 1];
+      // FIXED: Use the last node in the selectedNodes array as the entry node
+      const entryNode = selectedNodes[selectedNodes.length - 1];
       await axios.post(
-        `http://localhost:${BASE_ONION_ROUTER_PORT + firstNode.nodeId}/forwardMessage`,
+        `http://localhost:${BASE_ONION_ROUTER_PORT + entryNode.nodeId}/forwardMessage`,
         JSON.parse(currentPayload)
       );
   
