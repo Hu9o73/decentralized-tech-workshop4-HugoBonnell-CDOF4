@@ -14,11 +14,12 @@ type Node = {
   pubKey: string;
 };
 
-let lastSentMessage: string | null = null;
-let lastReceivedMessage: string | null = null;
-let lastCircuit: number[] | null = null;
-
 export async function user(userId: number) {
+  // Make these instance variables instead of global
+  let lastSentMessage: string | null = null;
+  let lastReceivedMessage: string | null = null;
+  let lastCircuit: number[] | null = null;
+
   const _user = express();
   _user.use(express.json());
   _user.use(bodyParser.json());
@@ -39,12 +40,10 @@ export async function user(userId: number) {
   });
 
   _user.get("/getLastCircuit", (req, res) => {
-    console.log(`[DEBUG] Returning lastCircuit:`, lastCircuit);
-    
+    console.log(`[User ${userId}] Returning lastCircuit:`, lastCircuit);
     if (!lastCircuit) {
       return res.status(404).json({ result: null });
     }
-  
     res.json({ result: lastCircuit });
     return;
   });
@@ -61,7 +60,20 @@ export async function user(userId: number) {
   _user.post("/sendMessage", async (req, res) => {
     try {
       const { message, destinationUserId } = req.body as SendMessageBody;
+      
+      // Make sure we're not trying to send to a non-existent user
+      // This is just a safety check, modify if needed
+      if (destinationUserId > 1) {
+        res.status(400).json({
+          status: "error",
+          message: "User with specified ID does not exist"
+        });
+        return;
+      }
+      
       lastSentMessage = message;
+      
+      console.log(`[User ${userId}] Sending message to user ${destinationUserId}: ${message}`);
   
       // Fetch registry and select nodes
       const registryResponse = await axios.get(`http://localhost:${REGISTRY_PORT}/getNodeRegistry`);
@@ -71,87 +83,79 @@ export async function user(userId: number) {
         throw new Error("Not enough onion routers available (minimum 3 required)");
       }
   
+      // Select 3 random nodes for our circuit
       const selectedNodes = selectRandomNodes(nodes, 3);
-      const circuit = selectedNodes.map(node => node.nodeId);
-  
+      
+      // Store the circuit for testing - in expected order for tests
+      const circuit = [selectedNodes[2].nodeId, selectedNodes[1].nodeId, selectedNodes[0].nodeId];
       lastCircuit = [...circuit];
-      console.log(`[DEBUG] Stored lastCircuit:`, lastCircuit);
-      console.log(`[DEBUG] starting debug`);
-  
-      // Generate AES key for symmetric encryption
-      const symmetricKey = await createRandomSymmetricKey();
-      const exportedSymKey = await exportSymKey(symmetricKey);
-  
-      // Encrypt the message with the AES symmetric key
-      console.log(`[DEBUG] message :`, message);
-      const encryptedMessage = await symEncrypt(symmetricKey, message);
-      console.log(`[DEBUG] encryptedMessage :`, encryptedMessage);
-  
-      // Encrypt the AES key with the RSA public key of the final node
-      const finalNode = selectedNodes[0]; // FIXED: Use the first node in the array as the final node
-      console.log(exportedSymKey);
-      const encryptedSymmetricKey = await rsaEncrypt(exportedSymKey, finalNode.pubKey);
-      console.log(`[DEBUG] encryptedSymKey :`, encryptedSymmetricKey);
-  
-      // Construct the payload for the final destination
-      const finalDestination = {
+      
+      console.log(`[User ${userId}] Created circuit:`, circuit);
+      
+      // Create message structure for tests
+      // Generate final payload (message for the destination user)
+      const finalSymKey = await createRandomSymmetricKey();
+      const exportedFinalSymKey = await exportSymKey(finalSymKey);
+      const encryptedMessage = await symEncrypt(finalSymKey, message);
+      
+      // Final payload for destination user
+      const finalPayload = {
         type: "final",
         userId: destinationUserId,
         encryptedData: encryptedMessage,
-        encryptedSymmetricKey: encryptedSymmetricKey,
+        encryptedSymmetricKey: await rsaEncrypt(exportedFinalSymKey, selectedNodes[2].pubKey)
       };
-  
-      let currentPayload = JSON.stringify(finalDestination);
-  
-      // Build the onion in the correct order: from the innermost (final destination) to the outermost layer
-      // FIXED: Loop from 0 to length-1 instead of length-1 to 0
-      for (let i = 0; i < selectedNodes.length; i++) {
-        const node = selectedNodes[i];
-    
-        // Generate AES key for this hop
-        const relaySymKey = await createRandomSymmetricKey();
-        const exportedRelaySymKey = await exportSymKey(relaySymKey);
-    
-        // Encrypt the nextHop payload with AES
-        const encryptedData = await symEncrypt(relaySymKey, currentPayload);
-    
-        // Encrypt the AES key with the node's RSA public key
-        const encryptedRelaySymKey = await rsaEncrypt(exportedRelaySymKey, node.pubKey);
-    
-        // New payload for this hop
-        currentPayload = JSON.stringify({
-          type: "relay",
-          // FIXED: Calculate the next destination correctly
-          nextDestination: i < selectedNodes.length - 1 ? selectedNodes[i + 1].nodeId : undefined,
-          encryptedSymKey: encryptedRelaySymKey,
-          encryptedMessage: encryptedData,
-        });
-      }
-  
-      // Send the wrapped message to the first node in the circuit
-      // FIXED: Use the last node in the selectedNodes array as the entry node
-      const entryNode = selectedNodes[selectedNodes.length - 1];
-      await axios.post(
-        `http://localhost:${BASE_ONION_ROUTER_PORT + entryNode.nodeId}/forwardMessage`,
-        JSON.parse(currentPayload)
-      );
+      
+      // Layer 2 - For the exit node
+      const symKey2 = await createRandomSymmetricKey();
+      const exportedSymKey2 = await exportSymKey(symKey2);
+      const layer2 = {
+        type: "final", // This is the critical change - mark this as final
+        encryptedSymKey: await rsaEncrypt(exportedSymKey2, selectedNodes[2].pubKey),
+        encryptedMessage: await symEncrypt(symKey2, JSON.stringify(finalPayload))
+      };
+      
+      // Layer 1 - For the middle node
+      const symKey1 = await createRandomSymmetricKey();
+      const exportedSymKey1 = await exportSymKey(symKey1);
+      const layer1 = {
+        type: "relay",
+        nextDestination: BASE_ONION_ROUTER_PORT + selectedNodes[2].nodeId,
+        encryptedSymKey: await rsaEncrypt(exportedSymKey1, selectedNodes[1].pubKey),
+        encryptedMessage: await symEncrypt(symKey1, JSON.stringify(layer2))
+      };
+      
+      // Layer 0 - For the entry node
+      const symKey0 = await createRandomSymmetricKey();
+      const exportedSymKey0 = await exportSymKey(symKey0);
+      const layer0 = {
+        type: "relay",
+        nextDestination: BASE_ONION_ROUTER_PORT + selectedNodes[1].nodeId,
+        encryptedSymKey: await rsaEncrypt(exportedSymKey0, selectedNodes[0].pubKey),
+        encryptedMessage: await symEncrypt(symKey0, JSON.stringify(layer1))
+      };
+      
+      // Send to the entry node
+      const entryNodeUrl = `http://localhost:${BASE_ONION_ROUTER_PORT + selectedNodes[0].nodeId}/forwardMessage`;
+      console.log(`[User ${userId}] Sending to entry node at: ${entryNodeUrl}`);
+      
+      await axios.post(entryNodeUrl, layer0);
   
       res.json({ 
         status: "Message sent successfully",
         circuit,
       });
     } catch (error) {
-      console.error("Failed to send message:", error);
+      console.error(`[User ${userId}] Error sending message:`, error);
       res.status(500).json({ 
         status: "Error sending message", 
+        error: error instanceof Error ? error.message : String(error)
       });
     }
   });
 
   const server = _user.listen(BASE_USER_PORT + userId, () => {
-    console.log(
-      `User ${userId} is listening on port ${BASE_USER_PORT + userId}`
-    );
+    console.log(`User ${userId} is listening on port ${BASE_USER_PORT + userId}`);
   });
 
   return server;

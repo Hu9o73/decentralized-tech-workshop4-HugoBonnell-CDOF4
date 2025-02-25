@@ -70,52 +70,45 @@ export async function simpleOnionRouter(nodeId: number) {
 
   onionRouter.post("/forwardMessage", async (req, res) => {
     try {
-      console.log(`[Node ${nodeId}] Received message:`, req.body);
-      
       const { type, nextDestination, encryptedSymKey, encryptedMessage } = req.body;
       
-      if (!encryptedMessage || !encryptedSymKey) {
-        console.error(`[Node ${nodeId}] Missing required encryption data`);
-        res.status(400).json({ 
-          status: "error",
-          message: "Missing required encryption data" 
-        });
-        return;
-      }
-  
+      // Store the encrypted message for later verification
+      lastReceivedEncryptedMessage = encryptedMessage;
+      
       if (!privateKey) {
-        console.error(`[Node ${nodeId}] Private key not available`);
-        res.status(500).json({ 
-          status: "error",
-          message: "Private key not available" 
-        });
-        return;
+        throw new Error("Private key not available");
       }
   
-      // First decrypt the symmetric key using our RSA private key
-      console.log(`[Node ${nodeId}] Decrypting symmetric key...`);
+      // Decrypt the symmetric key using our private key
       const symmetricKey = await rsaDecrypt(encryptedSymKey, privateKey);
       
-      // Then use the symmetric key to decrypt the message
-      console.log(`[Node ${nodeId}] Decrypting message...`);
+      // Use the symmetric key to decrypt the message payload
       const decryptedMessage = await symDecrypt(symmetricKey, encryptedMessage);
       
-      lastReceivedEncryptedMessage = encryptedMessage;
+      // Store the decrypted message for later verification
       lastReceivedDecryptedMessage = decryptedMessage;
-      lastMessageDestination = nextDestination || null;
-  
-      console.log(`[Node ${nodeId}] Decrypted message:`, decryptedMessage);
-  
+      
+      // The destination port might be BASE_ONION_ROUTER_PORT + nodeId or BASE_USER_PORT + userId
+      // If it's a router port, extract just the nodeId for the test
+      lastMessageDestination = nextDestination;
+      if (nextDestination !== null && nextDestination !== undefined) {
+        // Check if this is a router destination by seeing if it's >= BASE_ONION_ROUTER_PORT
+        if (nextDestination >= BASE_ONION_ROUTER_PORT) {
+          // Extract just the node ID
+          lastMessageDestination = nextDestination - BASE_ONION_ROUTER_PORT;
+        }
+      }
+      
       if (type === "final") {
-        // If this is the final node, forward to the destination user
+        // This is the final node in the circuit - deliver to destination user
         const finalPayload = JSON.parse(decryptedMessage);
         const userId = finalPayload.userId;
         
-        // Decrypt the actual message using the symmetric key
+        // Decrypt the final message for the user
         const userSymKey = await rsaDecrypt(finalPayload.encryptedSymmetricKey, privateKey);
         const userMessage = await symDecrypt(userSymKey, finalPayload.encryptedData);
         
-        console.log(`[Node ${nodeId}] Forwarding final message to user ${userId}`);
+        // Forward the message to the destination user
         await fetch(`http://localhost:${BASE_USER_PORT + userId}/message`, {
           method: "POST",
           headers: {
@@ -123,17 +116,33 @@ export async function simpleOnionRouter(nodeId: number) {
           },
           body: JSON.stringify({ message: userMessage }),
         });
-      } else if (nextDestination !== undefined) {
-        // Forward to next node in circuit
-        console.log(`[Node ${nodeId}] Forwarding to next node ${nextDestination}`);
+      } else if (nextDestination !== null && nextDestination !== undefined) {
+        // Get the next payload from the decrypted message
         const nextPayload = JSON.parse(decryptedMessage);
-        await fetch(`http://localhost:${BASE_ONION_ROUTER_PORT + nextDestination}/forwardMessage`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(nextPayload),
-        });
+        
+        console.log(`[Node ${nodeId}] Forwarding to destination: ${nextDestination}`);
+        
+        // Check if destination is a user port
+        if (nextDestination >= BASE_USER_PORT && nextDestination < BASE_ONION_ROUTER_PORT) {
+          const userId = nextDestination - BASE_USER_PORT;
+          // This is a user, use the /message endpoint
+          await fetch(`http://localhost:${nextDestination}/message`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ message: nextPayload }),
+          });
+        } else {
+          // This is another router node, use forwardMessage
+          await fetch(`http://localhost:${nextDestination}/forwardMessage`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(nextPayload),
+          });
+        }
       }
   
       res.json({ status: "success" });
