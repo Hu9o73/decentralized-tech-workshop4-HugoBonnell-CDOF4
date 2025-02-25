@@ -99,7 +99,15 @@ export async function rsaEncrypt(
   strPublicKey: string
 ): Promise<string> {
   const publicKey = await importPubKey(strPublicKey);
+  
+  // Check the length of the data being passed to RSA encryption
   const data = base64ToArrayBuffer(b64Data);
+  console.log(data)
+  if (data.byteLength > 245) {
+    console.error("Data is too large for RSA encryption");
+    throw new Error("Data is too large for RSA encryption");
+  }
+
   const encrypted = await webcrypto.subtle.encrypt(
     { name: "RSA-OAEP" },
     publicKey,
